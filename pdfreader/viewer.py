@@ -5,7 +5,7 @@ import math
 
 import pymupdf as fitz
 from PySide6.QtCore import (
-    QEasingCurve, QPointF, QRectF, Qt, QTimer, QUrl, QVariantAnimation, Signal,
+    QPointF, QRectF, Qt, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QColor, QCursor, QDesktopServices, QGuiApplication, QKeySequence, QPainter,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import icons, theme
+from .frameclock import clock, refresh_rate
 from .renderer import tile_grid
 
 PT_TO_PX = 96.0 / 72.0
@@ -91,15 +92,15 @@ class PdfView(QAbstractScrollArea):
         self._wheel_accum = 0.0
         self._indicator_timer = QTimer(self, singleShot=True, interval=900,
                                        timeout=self.viewport().update)
-        self._autoscroll = QTimer(self, interval=16, timeout=self._autoscroll_tick)
-        self._autoscroll_speed = 1.5
-        self._autoscroll_pos = 0.0
-
-        self._anim = QVariantAnimation(self)
-        self._anim.setDuration(230)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._anim.valueChanged.connect(lambda v: self.verticalScrollBar().setValue(round(v)))
-        self._anim_target = None
+        # Smooth scrolling is driven by a vsync-locked frame clock; the
+        # position is kept as a float so motion is exact to the device pixel.
+        self._fine_y: float | None = None
+        self._scroll_target: float | None = None
+        self._autoscroll_on = False
+        self._autoscroll_speed = 90.0  # logical px per second
+        self._clock_active = False
+        self._last_frame: float | None = None
+        clock().tick.connect(self._on_frame)
 
         self.setFrameShape(QAbstractScrollArea.Shape.NoFrame)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -154,7 +155,7 @@ class PdfView(QAbstractScrollArea):
             rows_to_place = rows
         self._pos = [None] * n
         vw = max(1, round(self.viewport().width() * self._dpr))
-        sizes = [(max(1, round(w * s)), max(1, round(h * s))) for w, h in self.doc.page_sizes]
+        sizes = [self._painted_size(i, s) for i in range(n)]
         widest = 0
         for row in rows_to_place:
             widest = max(widest, sum(sizes[i][0] for i in row) + gap * (len(row) - 1))
@@ -221,10 +222,26 @@ class PdfView(QAbstractScrollArea):
         return max(MIN_ZOOM, min(MAX_ZOOM, min(zw, zh)))
 
     # ---------------------------------------------------- coordinate helpers
+    def _current_y(self) -> float:
+        v = self.verticalScrollBar().value()
+        if self._fine_y is not None and abs(self._fine_y - v) <= 0.5:
+            return self._fine_y
+        return float(v)
+
+    def _set_scroll_y(self, y: float):
+        vs = self.verticalScrollBar()
+        y = max(float(vs.minimum()), min(float(vs.maximum()), y))
+        self._fine_y = y
+        iv = round(y)
+        if vs.value() != iv:
+            vs.setValue(iv)
+        else:
+            self.viewport().update()
+
     def _offset_dev(self):
         d = self._dpr
         sx = round(self.horizontalScrollBar().value() * d)
-        sy = round(self.verticalScrollBar().value() * d)
+        sy = round(self._current_y() * d)
         vh = round(self.viewport().height() * d)
         oy = (vh - self._content_h) // 2 if self._content_h < vh else 0
         return sx, sy - oy
@@ -409,7 +426,7 @@ class PdfView(QAbstractScrollArea):
         page = max(0, min(n - 1, page))
         if add_history:
             self._push_history()
-        self._anim.stop()
+        self._stop_smooth_scroll()
         if self.layout_mode in ("single", "two"):
             if self._row_of(page) != self._row_of(self._single_page) or self._pos[page] is None:
                 self._single_page = page
@@ -579,21 +596,20 @@ class PdfView(QAbstractScrollArea):
             if missing:
                 fb = self.renderer.best_fallback(i, self.invert)
                 if fb is not None:
+                    fb.setDevicePixelRatio(1.0)
                     p.drawPixmap(target, fb, QRectF(fb.rect()))
                 else:
                     p.fillRect(target, QColor("#000000") if self.invert else QColor("#ffffff"))
                     self.renderer.request_thumb(self.renderer.thumb_key(i, self.invert))
-            # draw sharp tiles at integer device positions
-            fx, fy = w / pw, h / ph
+            # draw sharp tiles pixel for pixel (no scaling -> no blur)
+            p.save()
+            p.setClipRect(target)
             for c, r, pm in tiles:
                 if pm is None:
                     continue
-                tx0 = x + round(c * tw * fx)
-                ty0 = y + round(r * th * fy)
-                tx1 = x + round(min(pw, (c + 1) * tw) * fx)
-                ty1 = y + round(min(ph, (r + 1) * th) * fy)
-                p.drawPixmap(QRectF((tx0 - sx) / d, (ty0 - sy) / d, (tx1 - tx0) / d, (ty1 - ty0) / d),
-                             pm, QRectF(pm.rect()))
+                pm.setDevicePixelRatio(d)
+                p.drawPixmap(QPointF((x + c * tw - sx) / d, (y + r * th - sy) / d), pm)
+            p.restore()
             self._paint_overlays(p, i)
 
         self.renderer.retain_tiles(wanted)
@@ -603,8 +619,13 @@ class PdfView(QAbstractScrollArea):
         p.end()
 
     def _painted_size(self, i, s):
+        """Exact pixel size MuPDF produces for page ``i`` at scale ``s``.
+
+        Using MuPDF's own rounding keeps the layout and the rendered images
+        the same size, so pages are drawn 1:1 and never resampled (blurred).
+        """
         w, h = self.doc.page_sizes[i]
-        return max(1, round(w * s)), max(1, round(h * s))
+        return max(1, math.ceil(w * s - 1e-3)), max(1, math.ceil(h * s - 1e-3))
 
     def _request_page(self, i, s, wanted, sx, sy, vw_dev, vh_dev, prefetch=False):
         x, y, w, h = self._pos[i]
@@ -976,8 +997,8 @@ class PdfView(QAbstractScrollArea):
     def mousePressEvent(self, e):
         self.setFocus()
         pos = e.position()
-        self._anim.stop()
-        if self._autoscroll.isActive():
+        self._stop_smooth_scroll()
+        if self._autoscroll_on:
             self.stop_autoscroll()
         if e.button() == Qt.MouseButton.MiddleButton or (
                 e.button() == Qt.MouseButton.LeftButton and (self.tool == "hand" or self._space_pan)):
@@ -1286,11 +1307,11 @@ class PdfView(QAbstractScrollArea):
         horizontal = bool(mods & Qt.KeyboardModifier.ShiftModifier)
         if not pd.isNull() and not horizontal:
             # precise touchpad scrolling is already smooth
-            self._anim.stop()
+            self._stop_smooth_scroll()
             hs, vs = self.horizontalScrollBar(), self.verticalScrollBar()
             hs.setValue(hs.value() - pd.x())
             if not self._single_page_flip(-pd.y()):
-                vs.setValue(vs.value() - pd.y())
+                self._set_scroll_y(self._current_y() - pd.y())
             e.accept()
             return
         dy = ad.y()
@@ -1333,50 +1354,78 @@ class PdfView(QAbstractScrollArea):
 
     def smooth_scroll_by(self, delta: float):
         vs = self.verticalScrollBar()
-        if self._anim.state() == QVariantAnimation.State.Running and self._anim_target is not None:
-            base = self._anim_target
+        base = self._scroll_target if self._scroll_target is not None else self._current_y()
+        self._scroll_target = max(float(vs.minimum()), min(float(vs.maximum()), base + delta))
+        self._run_clock(True)
+
+    def _stop_smooth_scroll(self):
+        self._scroll_target = None
+        if not self._autoscroll_on:
+            self._run_clock(False)
+
+    def _run_clock(self, on: bool):
+        if on and not self._clock_active:
+            self._clock_active = True
+            self._last_frame = None
+            clock().acquire()
+        elif not on and self._clock_active:
+            self._clock_active = False
+            clock().release()
+
+    def _on_frame(self, t: float):
+        """One display frame: advance smooth scrolling / autoscroll."""
+        if not self._clock_active:
+            return
+        dt = (t - self._last_frame) if self._last_frame is not None else 1.0 / refresh_rate()
+        dt = max(0.0, min(dt, 0.05))
+        self._last_frame = t
+        y = self._current_y()
+        vs = self.verticalScrollBar()
+        if self._scroll_target is not None:
+            target = self._scroll_target
+            ny = y + (target - y) * (1.0 - math.exp(-dt / 0.045))
+            if abs(target - ny) * self._dpr < 0.5:
+                ny = target
+                self._scroll_target = None
+            self._set_scroll_y(ny)
+        elif self._autoscroll_on:
+            self._set_scroll_y(y + self._autoscroll_speed * dt)
+            if vs.value() >= vs.maximum():
+                self.stop_autoscroll()
         else:
-            base = vs.value()
-        target = max(vs.minimum(), min(vs.maximum(), base + delta))
-        self._anim_target = target
-        self._anim.stop()
-        self._anim.setStartValue(float(vs.value()))
-        self._anim.setEndValue(float(target))
-        self._anim.start()
+            self._run_clock(False)
+            return
+        self.viewport().repaint()  # present this frame right away
+        if self._scroll_target is None and not self._autoscroll_on:
+            self._run_clock(False)
 
     # ------------------------------------------------------------ autoscroll
     def toggle_autoscroll(self):
-        if self._autoscroll.isActive():
+        if self._autoscroll_on:
             self.stop_autoscroll()
         else:
-            self._autoscroll_pos = float(self.verticalScrollBar().value())
-            self._autoscroll.start()
+            self._autoscroll_on = True
+            self._scroll_target = None
+            self._run_clock(True)
             self.statusMessage.emit("Автопрокрутка: ↑/↓ — скорость, Esc — стоп")
 
     def stop_autoscroll(self):
-        self._autoscroll.stop()
+        self._autoscroll_on = False
+        if self._scroll_target is None:
+            self._run_clock(False)
         self.statusMessage.emit("")
-
-    def _autoscroll_tick(self):
-        vs = self.verticalScrollBar()
-        if abs(vs.value() - self._autoscroll_pos) > 2:
-            self._autoscroll_pos = float(vs.value())
-        self._autoscroll_pos += self._autoscroll_speed
-        vs.setValue(round(self._autoscroll_pos))
-        if vs.value() >= vs.maximum():
-            self.stop_autoscroll()
 
     # ============================================================== keyboard
     def keyPressEvent(self, e):
         key = e.key()
         mods = e.modifiers()
         vs, hs = self.verticalScrollBar(), self.horizontalScrollBar()
-        if self._autoscroll.isActive():
+        if self._autoscroll_on:
             if key == Qt.Key.Key_Up:
-                self._autoscroll_speed = max(0.25, self._autoscroll_speed / 1.4)
+                self._autoscroll_speed = max(10.0, self._autoscroll_speed / 1.4)
                 return
             if key == Qt.Key.Key_Down:
-                self._autoscroll_speed = min(40, self._autoscroll_speed * 1.4)
+                self._autoscroll_speed = min(3000.0, self._autoscroll_speed * 1.4)
                 return
             if key == Qt.Key.Key_Escape:
                 self.stop_autoscroll()

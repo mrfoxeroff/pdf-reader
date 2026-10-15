@@ -13,6 +13,16 @@ from . import icons, theme
 from .version import APP_NAME
 
 SERVER_NAME = f"PDFReader-{os.environ.get('USERNAME', 'user')}"
+APP_MUTEX = "PDFReaderAppMutex"  # also referenced by installer.iss (AppMutex)
+_mutex = None
+
+
+def _create_app_mutex():
+    """Lets the installer/uninstaller detect that the app is running."""
+    global _mutex
+    if sys.platform == "win32":
+        import ctypes
+        _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, APP_MUTEX)
 
 
 def _send_to_running_instance(paths: list[str]) -> bool:
@@ -41,6 +51,7 @@ def main(argv=None) -> int:
     if not any(a.startswith("--screenshot=") for a in argv) and _send_to_running_instance(files):
         return 0
 
+    _create_app_mutex()
     from .pool import pool, shutdown_pool
     pool()  # start worker processes early, while the window is being built
 

@@ -1,4 +1,4 @@
-# PyInstaller spec: builds a single-file PDFReader.exe
+# PyInstaller spec: folder build (dist\PDFReader\) packaged by installer.iss
 # Usage:  .venv\Scripts\pyinstaller PDFReader.spec --noconfirm
 import os
 
@@ -40,9 +40,8 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="PDFReader",
     icon="assets/icon.ico",
     version="version_info.txt",
@@ -50,5 +49,13 @@ exe = EXE(
     debug=False,
     strip=False,
     upx=False,
-    runtime_tmpdir=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="PDFReader",
 )
