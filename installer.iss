@@ -3,7 +3,7 @@
 ;   "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer.iss
 
 #define AppName "PDF Reader"
-#define AppVersion "1.1.0"
+#define AppVersion "1.1.1"
 #define AppExe "PDFReader.exe"
 #define ProgId "PDFReader.Document"
 

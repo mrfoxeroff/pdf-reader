@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import pymupdf as fitz
 from PySide6.QtCore import (
@@ -100,6 +101,8 @@ class PdfView(QAbstractScrollArea):
         self._autoscroll_speed = 90.0  # logical px per second
         self._clock_active = False
         self._last_frame: float | None = None
+        # middle-button autoscroll ("anchor" scrolling as in browsers/Acrobat)
+        self._mmb: dict | None = None
         clock().tick.connect(self._on_frame)
 
         self.setFrameShape(QAbstractScrollArea.Shape.NoFrame)
@@ -616,6 +619,8 @@ class PdfView(QAbstractScrollArea):
         self._paint_drag(p)
         if self._indicator_timer.isActive() and not self.presentation:
             self._paint_page_indicator(p)
+        if self._mmb is not None:
+            self._paint_mmb_anchor(p)
         p.end()
 
     def _painted_size(self, i, s):
@@ -709,6 +714,31 @@ class PdfView(QAbstractScrollArea):
                 p.drawEllipse(r)
             else:
                 p.drawRect(r)
+
+    def _paint_mmb_anchor(self, p: QPainter):
+        """Round marker with arrows at the middle-click anchor point."""
+        c = self._mmb["anchor"]
+        horiz = self.horizontalScrollBar().maximum() > 0
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(60, 60, 60, 200), 1.2))
+        p.setBrush(QColor(255, 255, 255, 225))
+        p.drawEllipse(c, 15.0, 15.0)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(50, 50, 50, 230))
+        arrows = [((0, -1), (1, 0)), ((0, 1), (1, 0))]
+        if horiz:
+            arrows += [((-1, 0), (0, 1)), ((1, 0), (0, 1))]
+        for (dx, dy), (px, py) in arrows:
+            tip = QPointF(c.x() + dx * 11, c.y() + dy * 11)
+            base = QPointF(c.x() + dx * 5.5, c.y() + dy * 5.5)
+            path = QPainterPath(tip)
+            path.lineTo(base.x() + px * 4.5, base.y() + py * 4.5)
+            path.lineTo(base.x() - px * 4.5, base.y() - py * 4.5)
+            path.closeSubpath()
+            p.drawPath(path)
+        p.drawEllipse(c, 2.0, 2.0)
+        p.restore()
 
     def _paint_page_indicator(self, p: QPainter):
         text = f"{self.current_page + 1} из {self.doc.page_count}"
@@ -1000,8 +1030,14 @@ class PdfView(QAbstractScrollArea):
         self._stop_smooth_scroll()
         if self._autoscroll_on:
             self.stop_autoscroll()
-        if e.button() == Qt.MouseButton.MiddleButton or (
-                e.button() == Qt.MouseButton.LeftButton and (self.tool == "hand" or self._space_pan)):
+        if self._mmb is not None:
+            # any click ends the latched middle-button scrolling
+            self._end_mmb()
+            return
+        if e.button() == Qt.MouseButton.MiddleButton:
+            self._start_mmb(pos)
+            return
+        if e.button() == Qt.MouseButton.LeftButton and (self.tool == "hand" or self._space_pan):
             self._drag = {"kind": "pan", "last": pos, "start": pos, "moved": False,
                           "hit": self.widget_to_page(pos)}
             self._update_cursor()
@@ -1063,6 +1099,10 @@ class PdfView(QAbstractScrollArea):
 
     def mouseMoveEvent(self, e):
         pos = e.position()
+        if self._mmb is not None:
+            d = pos - self._mmb["anchor"]
+            self._mmb["moved"] = max(self._mmb["moved"], abs(d.x()) + abs(d.y()))
+            return
         dr = self._drag
         if dr is None:
             self._update_cursor(pos)
@@ -1129,6 +1169,13 @@ class PdfView(QAbstractScrollArea):
             vs.setValue(vs.value() + 20)
 
     def mouseReleaseEvent(self, e):
+        if self._mmb is not None and e.button() == Qt.MouseButton.MiddleButton and self._mmb["held"]:
+            self._mmb["held"] = False
+            # a long press or a press-and-move is temporary scrolling;
+            # a short click keeps the mode on until the next click
+            if time.perf_counter() - self._mmb["t0"] > 0.35 or self._mmb["moved"] > 12:
+                self._end_mmb()
+            return
         dr = self._drag
         self._drag = None
         if dr is None:
@@ -1294,6 +1341,8 @@ class PdfView(QAbstractScrollArea):
 
     # ============================================================ scrolling
     def wheelEvent(self, e):
+        if self._mmb is not None:
+            self._end_mmb()
         mods = e.modifiers()
         if mods & Qt.KeyboardModifier.ControlModifier:
             dy = e.angleDelta().y() or e.pixelDelta().y()
@@ -1360,8 +1409,42 @@ class PdfView(QAbstractScrollArea):
 
     def _stop_smooth_scroll(self):
         self._scroll_target = None
-        if not self._autoscroll_on:
+        if not self._clock_needed():
             self._run_clock(False)
+
+    def _clock_needed(self) -> bool:
+        return self._scroll_target is not None or self._autoscroll_on or self._mmb is not None
+
+    # ------------------------------------------------- middle-button scrolling
+    MMB_DEADZONE = 6.0
+
+    def _start_mmb(self, pos: QPointF):
+        self._mmb = {"anchor": QPointF(pos), "t0": time.perf_counter(), "held": True,
+                     "moved": 0.0, "acc_x": 0.0}
+        horiz = self.horizontalScrollBar().maximum() > 0
+        self.viewport().setCursor(Qt.CursorShape.SizeAllCursor if horiz else Qt.CursorShape.SizeVerCursor)
+        self._run_clock(True)
+        self.viewport().update()
+
+    def _end_mmb(self):
+        if self._mmb is None:
+            return
+        self._mmb = None
+        if not self._clock_needed():
+            self._run_clock(False)
+        self._update_cursor(QPointF(self.viewport().mapFromGlobal(QCursor.pos())))
+        self.viewport().update()
+
+    def _mmb_speed(self, d: float) -> float:
+        """Scroll speed (logical px/s) for a cursor offset from the anchor."""
+        dist = abs(d) - self.MMB_DEADZONE
+        if dist <= 0:
+            return 0.0
+        return math.copysign(3.2 * dist ** 1.35, d)
+
+    def focusOutEvent(self, e):
+        self._end_mmb()
+        super().focusOutEvent(e)
 
     def _run_clock(self, on: bool):
         if on and not self._clock_active:
@@ -1381,7 +1464,20 @@ class PdfView(QAbstractScrollArea):
         self._last_frame = t
         y = self._current_y()
         vs = self.verticalScrollBar()
-        if self._scroll_target is not None:
+        if self._mmb is not None:
+            pos = QPointF(self.viewport().mapFromGlobal(QCursor.pos()))
+            d = pos - self._mmb["anchor"]
+            vy = self._mmb_speed(d.y())
+            if vy and not self._single_page_flip(vy * dt):
+                self._set_scroll_y(y + vy * dt)
+            hs = self.horizontalScrollBar()
+            if hs.maximum() > 0:
+                self._mmb["acc_x"] += self._mmb_speed(d.x()) * dt
+                step = int(self._mmb["acc_x"])
+                if step:
+                    self._mmb["acc_x"] -= step
+                    hs.setValue(hs.value() + step)
+        elif self._scroll_target is not None:
             target = self._scroll_target
             ny = y + (target - y) * (1.0 - math.exp(-dt / 0.045))
             if abs(target - ny) * self._dpr < 0.5:
@@ -1396,7 +1492,7 @@ class PdfView(QAbstractScrollArea):
             self._run_clock(False)
             return
         self.viewport().repaint()  # present this frame right away
-        if self._scroll_target is None and not self._autoscroll_on:
+        if not self._clock_needed():
             self._run_clock(False)
 
     # ------------------------------------------------------------ autoscroll
@@ -1411,7 +1507,7 @@ class PdfView(QAbstractScrollArea):
 
     def stop_autoscroll(self):
         self._autoscroll_on = False
-        if self._scroll_target is None:
+        if not self._clock_needed():
             self._run_clock(False)
         self.statusMessage.emit("")
 
@@ -1430,6 +1526,9 @@ class PdfView(QAbstractScrollArea):
             if key == Qt.Key.Key_Escape:
                 self.stop_autoscroll()
                 return
+        if key == Qt.Key.Key_Escape and self._mmb is not None:
+            self._end_mmb()
+            return
         if key == Qt.Key.Key_Escape:
             if self._drag:
                 self._drag = None
