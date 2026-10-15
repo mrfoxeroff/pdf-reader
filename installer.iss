@@ -3,7 +3,7 @@
 ;   "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer.iss
 
 #define AppName "PDF Reader"
-#define AppVersion "1.1.1"
+#define AppVersion "1.2.0"
 #define AppExe "PDFReader.exe"
 #define ProgId "PDFReader.Document"
 
@@ -45,9 +45,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [CustomMessages]
 russian.PdfDocument=Документ PDF
 russian.AppDescription=Быстрый автономный просмотрщик PDF
+russian.UpdateShortcut=Обновить {#AppName}
 russian.ChooseDefault=Открыть параметры Windows, чтобы сделать {#AppName} программой по умолчанию для PDF
 english.PdfDocument=PDF Document
 english.AppDescription=Fast offline PDF viewer
+english.UpdateShortcut=Update {#AppName}
 english.ChooseDefault=Open Windows Settings to make {#AppName} the default PDF app
 
 [Tasks]
@@ -55,6 +57,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "dist\PDFReader\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "assets\Update.cmd"; DestDir: "{app}"; Flags: ignoreversion
 
 [InstallDelete]
 ; files of an older build that no longer exist in the new one
@@ -62,6 +65,7 @@ Type: filesandordirs; Name: "{app}\_internal"
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
+Name: "{autoprograms}\{cm:UpdateShortcut}"; Filename: "{app}\{#AppExe}"; Parameters: "--update --yes"; IconFilename: "{app}\{#AppExe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Registry]
@@ -82,6 +86,14 @@ Root: HKA; Subkey: "Software\PDFReader\Capabilities\FileAssociations"; ValueType
 Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#AppName}"; ValueData: "Software\PDFReader\Capabilities"; Flags: uninsdeletevalue
 
 [Run]
+; after a silent self-update (/RELAUNCH=1) start the new version
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: ShouldRelaunch
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 Filename: "ms-settings:defaultapps?registeredAppUser={#AppName}"; Description: "{cm:ChooseDefault}"; Flags: shellexec postinstall skipifsilent unchecked nowait; Check: not IsAdminInstallMode
 Filename: "ms-settings:defaultapps?registeredAppMachine={#AppName}"; Description: "{cm:ChooseDefault}"; Flags: shellexec postinstall skipifsilent unchecked nowait; Check: IsAdminInstallMode
+
+[Code]
+function ShouldRelaunch: Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;

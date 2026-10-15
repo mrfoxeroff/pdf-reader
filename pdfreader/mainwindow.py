@@ -9,7 +9,7 @@ from PySide6.QtGui import QAction, QActionGroup, QColor, QIntValidator, QKeySequ
 from PySide6.QtWidgets import (
     QApplication, QColorDialog, QComboBox, QFileDialog, QInputDialog, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QSizePolicy, QTabWidget,
-    QToolBar, QToolButton, QWidget,
+    QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from . import icons, theme
@@ -17,12 +17,17 @@ from .dialogs import HomePage, PropertiesDialog, ShortcutsDialog, about_text
 from .doctab import DocumentTab
 from .document import PasswordRequired, PdfDocument
 from .printing import print_document
+from . import convert, convertui, updater
 from .settings import Settings
+from .updateui import AutoUpdateScheduler, UpdateBanner, UpdateDialog
 from .version import APP_NAME
 from .viewer import TOOL_NAMES, TOOLS_WITH_COLOR, _qcolor
 
-OPEN_FILTER = ("Все поддерживаемые (*.pdf *.xps *.oxps *.epub *.cbz *.fb2 *.mobi);;"
-               "PDF (*.pdf);;Все файлы (*.*)")
+OPEN_FILTER = ("Все поддерживаемые (*.pdf *.xps *.oxps *.epub *.cbz *.fb2 *.mobi "
+               "*.docx *.doc *.rtf *.odt *.txt);;"
+               "PDF (*.pdf);;Документы Word (*.docx *.doc *.docm *.rtf *.odt);;Все файлы (*.*)")
+WORD_FILTER = ("Документы Word и текст (*.docx *.doc *.docm *.dotx *.rtf *.odt *.wps *.txt *.htm *.html *.md);;"
+               "Все файлы (*.*)")
 SUPPORTED_EXT = (".pdf", ".xps", ".oxps", ".epub", ".cbz", ".fb2", ".mobi")
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp")
 
@@ -58,7 +63,16 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.home, icons.icon("home"), "Главная")
         self.tabs.tabBar().setTabButton(0, self.tabs.tabBar().ButtonPosition.RightSide, None)
         self.tabs.tabBar().setTabButton(0, self.tabs.tabBar().ButtonPosition.LeftSide, None)
-        self.setCentralWidget(self.tabs)
+        central = QWidget()
+        cl = QVBoxLayout(central)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+        self.update_banner = UpdateBanner()
+        self.update_banner.updateRequested.connect(lambda rel: self.show_update_dialog(rel))
+        cl.addWidget(self.update_banner)
+        cl.addWidget(self.tabs, 1)
+        self.setCentralWidget(central)
+        self._closed_for_exit = False
 
         self._build_actions()
         self._build_menus()
@@ -73,6 +87,9 @@ class MainWindow(QMainWindow):
         if geo is not None:
             self.restoreGeometry(geo)
         self._update_actions()
+        self.update_scheduler = AutoUpdateScheduler(self, self.update_banner, self.settings)
+        self.update_scheduler.start()
+        updater.cleanup_downloads()
 
     # ================================================================ helpers
     def tab(self) -> DocumentTab | None:
@@ -214,6 +231,15 @@ class MainWindow(QMainWindow):
 
         self.a_shortcuts = A("Горячие клавиши", lambda: ShortcutsDialog(self).exec(), "F1", needs_doc=False)
         self.a_about = A("О программе", self.about, None, "info", needs_doc=False)
+        self.a_check_updates = A("Проверить обновления…", lambda: self.show_update_dialog(), None,
+                                 "download", needs_doc=False)
+        self.a_auto_update = A("Автоматически проверять обновления", self._set_auto_update, None,
+                               checkable=True, needs_doc=False)
+        self.a_auto_update.setChecked(bool(self.settings.get("auto_update", True)))
+        self.a_word_to_pdf = A("Word → PDF…", self.word_to_pdf_dialog, None, "word", needs_doc=False,
+                               tip="Преобразовать документы Word (DOCX, DOC, RTF, ODT, TXT) в PDF")
+        self.a_pdf_to_word = A("PDF → Word (DOCX)…", self.pdf_to_word, None, "convert",
+                               tip="Преобразовать открытый PDF в документ Word")
         self.a_escape = A("Выход из режима", self.escape_modes, None, needs_doc=False)
 
     def _build_menus(self):
@@ -229,6 +255,9 @@ class MainWindow(QMainWindow):
         exp = m.addMenu("Экспорт")
         exp.addAction(self.a_export_img)
         exp.addAction(self.a_export_txt)
+        conv = m.addMenu(icons.icon("convert"), "Преобразовать")
+        conv.addAction(self.a_word_to_pdf)
+        conv.addAction(self.a_pdf_to_word)
         m.addSeparator()
         m.addAction(self.a_print)
         m.addAction(self.a_props)
@@ -286,6 +315,10 @@ class MainWindow(QMainWindow):
 
         m = mb.addMenu("&Справка")
         m.addAction(self.a_shortcuts)
+        m.addSeparator()
+        m.addAction(self.a_check_updates)
+        m.addAction(self.a_auto_update)
+        m.addSeparator()
         m.addAction(self.a_about)
 
     def _build_toolbar(self):
@@ -297,6 +330,16 @@ class MainWindow(QMainWindow):
         self.toolbar = tb
         for a in (self.a_open, self.a_save, self.a_print):
             tb.addAction(a)
+        conv_btn = QToolButton()
+        conv_btn.setIcon(icons.icon("convert"))
+        self._icon_actions.append((conv_btn, "convert"))
+        conv_btn.setToolTip("Преобразовать: Word ↔ PDF")
+        cm = QMenu(conv_btn)
+        cm.addAction(self.a_word_to_pdf)
+        cm.addAction(self.a_pdf_to_word)
+        conv_btn.setMenu(cm)
+        conv_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        tb.addWidget(conv_btn)
         tb.addSeparator()
         tb.addAction(self.a_find)
         tb.addSeparator()
@@ -385,6 +428,9 @@ class MainWindow(QMainWindow):
             self.settings.remove_recent(path)
             self.home.refresh()
             return None
+        if path.lower().endswith(convert.CONVERTIBLE_EXT):
+            self.convert_and_open(path)
+            return None
         if path.lower().endswith(IMAGE_EXT):
             return self._open_images([path])
         password = None
@@ -428,6 +474,7 @@ class MainWindow(QMainWindow):
         idx = self.tabs.addTab(t, icons.icon("file_pdf", "#d7373f"), doc.title)
         self.tabs.setTabToolTip(idx, doc.path or doc.title)
         self.tabs.setCurrentIndex(idx)
+        self._update_tab_title(t)
         st = self.settings.position(restore) if restore else None
 
         def apply_state():
@@ -886,7 +933,8 @@ class MainWindow(QMainWindow):
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
             for u in e.mimeData().urls():
-                if u.isLocalFile() and u.toLocalFile().lower().endswith(SUPPORTED_EXT + IMAGE_EXT):
+                if u.isLocalFile() and u.toLocalFile().lower().endswith(
+                        SUPPORTED_EXT + IMAGE_EXT + convert.CONVERTIBLE_EXT):
                     e.acceptProposedAction()
                     return
 
@@ -894,24 +942,141 @@ class MainWindow(QMainWindow):
         for u in e.mimeData().urls():
             if u.isLocalFile():
                 p = u.toLocalFile()
-                if p.lower().endswith(SUPPORTED_EXT + IMAGE_EXT):
+                if p.lower().endswith(SUPPORTED_EXT + IMAGE_EXT + convert.CONVERTIBLE_EXT):
                     self.open_file(p)
 
     # ================================================================ close
-    def closeEvent(self, e):
+    def close_everything(self) -> bool:
+        """Ask to save modified documents and shut all tabs down.
+
+        Returns False if the user cancelled.
+        """
+        if self._closed_for_exit:
+            return True
         for t in self.doc_tabs():
             if t.doc.modified:
                 idx = self.tabs.indexOf(t)
                 if not self.close_tab(idx):
-                    e.ignore()
-                    return
+                    return False
         for t in self.doc_tabs():
             self._remember(t)
             t.shutdown()
         if not self._presentation:
             self.settings.set("maximized", self.isMaximized())
             self.settings.set("geometry", self.saveGeometry())
-        e.accept()
+        self._closed_for_exit = True
+        return True
+
+    def closeEvent(self, e):
+        if self.close_everything():
+            e.accept()
+        else:
+            e.ignore()
+
+    # ============================================================== updates
+    def show_update_dialog(self, release=None, auto=False):
+        self.update_banner.hide()
+        dlg = UpdateDialog(self, release=release, auto=auto, prepare_exit=self.close_everything)
+        dlg.exec()
+        if dlg.installed:
+            QApplication.instance().quit()
+
+    def _set_auto_update(self, on):
+        if not hasattr(self, "update_scheduler"):
+            return  # initial setChecked() while the window is being built
+        self.settings.set("auto_update", bool(on))
+        if on:
+            self.update_scheduler.check_now()
+        else:
+            self.update_banner.hide()
+
+    # =========================================================== conversion
+    def word_to_pdf_dialog(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Word → PDF: выберите документы",
+                                                self.settings.last_dir(), WORD_FILTER)
+        self._convert_queue = list(paths)
+        self._convert_next()
+
+    def _convert_next(self):
+        queue = getattr(self, "_convert_queue", [])
+        if queue:
+            self.convert_and_open(queue.pop(0), then=self._convert_next)
+
+    def convert_and_open(self, src: str, then=None):
+        """Convert a Word/text document to PDF and open it as a new (unsaved) tab."""
+        from .paths import temp_dir
+        base = os.path.splitext(os.path.basename(src))[0]
+        tmp = os.path.join(temp_dir(), f"conv_{id(src)}_{base}.pdf")
+        self.settings.set_last_dir(src)
+
+        def done(path, backend):
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+                doc = PdfDocument.from_bytes(data, base + ".pdf")
+            except Exception as exc:
+                QMessageBox.critical(self, APP_NAME, f"Не удалось открыть результат:\n{exc}")
+                return
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            doc.set_modified(True)
+            self._add_tab(doc)
+            self.statusBar().showMessage(
+                f"«{os.path.basename(src)}» преобразован в PDF ({convert.describe_backend(backend)}). "
+                "Сохраните его через «Файл → Сохранить как».", 8000)
+            if then:
+                QTimer.singleShot(0, then)
+
+        def error(msg):
+            QMessageBox.warning(self, "Преобразование в PDF",
+                                f"Не удалось преобразовать «{os.path.basename(src)}»:\n\n{msg}")
+            if then:
+                QTimer.singleShot(0, then)
+
+        convertui.run_with_progress(self, "to_pdf", src, tmp, done, error)
+
+    def pdf_to_word(self):
+        t = self.tab()
+        if t is None:
+            return
+        base = os.path.splitext(t.doc.title)[0] + ".docx"
+        start_dir = os.path.dirname(t.doc.path) if t.doc.path else self.settings.last_dir()
+        dst, _ = QFileDialog.getSaveFileName(self, "PDF → Word: сохранить как",
+                                             os.path.join(start_dir, base), "Документ Word (*.docx)")
+        if not dst:
+            return
+        if not dst.lower().endswith(".docx"):
+            dst += ".docx"
+        # the converter needs an unencrypted, up-to-date file on disk
+        if t.doc.path and not t.doc.modified and not t.doc.password:
+            src = t.doc.path
+        else:
+            from .paths import temp_dir
+            src = os.path.join(temp_dir(), f"export_{t.doc.id}.pdf")
+            t.doc.save_copy(src)
+
+        def done(path, backend):
+            box = QMessageBox(self)
+            box.setWindowTitle("PDF → Word")
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText(f"Документ Word сохранён ({convert.describe_backend(backend)}):\n{path}")
+            b_open = box.addButton("Открыть", QMessageBox.ButtonRole.AcceptRole)
+            b_folder = box.addButton("Показать в папке", QMessageBox.ButtonRole.ActionRole)
+            box.addButton("Закрыть", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is b_open:
+                os.startfile(path)
+            elif box.clickedButton() is b_folder:
+                import subprocess
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+
+        def error(msg):
+            QMessageBox.warning(self, "PDF → Word", f"Не удалось преобразовать документ:\n\n{msg}")
+
+        convertui.run_with_progress(self, "to_docx", src, dst, done, error)
 
 
 def parse_ranges(text: str, n: int) -> list[int]:

@@ -132,6 +132,8 @@ def stylesheet(t: Theme) -> str:
     #sideRail {{ background: {t.bar}; border-right: 1px solid {t.bar_border}; }}
     #sidePanel {{ background: {t.bar}; border-right: 1px solid {t.bar_border}; }}
     #panelTitle {{ font-size: 10pt; font-weight: 600; padding: 8px 10px; }}
+    #updateBanner {{ background: {t.selection}; border-bottom: 1px solid {t.bar_border}; }}
+    #updateBanner QLabel {{ background: transparent; }}
     #findBar {{ background: {t.bar}; border: 1px solid {t.bar_border}; border-radius: 8px; }}
     #homePage {{ background: {t.window}; }}
     #homeTitle {{ font-size: 20pt; font-weight: 300; }}

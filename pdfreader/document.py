@@ -496,6 +496,11 @@ class PdfDocument(QObject):
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n\f".join(parts))
 
+    def save_copy(self, path: str):
+        """Write the current content (decrypted, with edits) to ``path``."""
+        with self.lock:
+            self.doc.save(path, garbage=1, deflate=True)
+
     def metadata(self) -> dict:
         with self.lock:
             md = dict(self.doc.metadata or {})

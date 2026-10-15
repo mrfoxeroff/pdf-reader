@@ -4,7 +4,7 @@ import os
 
 block_cipher = None
 EXCLUDES = [
-    "tkinter", "unittest", "pydoc", "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuickWidgets",
+    "tkinter", "unittest", "pydoc", "numpy", "cv2", "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuickWidgets",
     "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.Qt3DCore", "PySide6.QtMultimedia",
     "PySide6.QtCharts", "PySide6.QtDataVisualization", "PySide6.QtSql", "PySide6.QtDesigner",
     "PySide6.QtOpenGL", "PySide6.QtOpenGLWidgets", "PySide6.QtPdf", "PySide6.QtPdfWidgets",
@@ -17,7 +17,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[("assets/icon.png", "assets")],
-    hiddenimports=[],
+    hiddenimports=["win32process", "win32com.client", "pythoncom", "pywintypes"],
     excludes=EXCLUDES,
     noarchive=False,
 )

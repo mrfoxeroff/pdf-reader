@@ -13,6 +13,7 @@ from . import icons, theme
 from .version import APP_NAME
 
 SERVER_NAME = f"PDFReader-{os.environ.get('USERNAME', 'user')}"
+UPDATE_COMMAND = "::update::"
 APP_MUTEX = "PDFReaderAppMutex"  # also referenced by installer.iss (AppMutex)
 _mutex = None
 
@@ -41,12 +42,21 @@ def _send_to_running_instance(paths: list[str]) -> bool:
 def main(argv=None) -> int:
     argv = list(sys.argv if argv is None else argv)
     files = [os.path.abspath(a) for a in argv[1:] if not a.startswith("-") and os.path.exists(a)]
+    update_mode = "--update" in argv  # used by the Update script / shortcut
+    auto_update = "--yes" in argv
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("PDFReader")
     app.setFont(QFont("Segoe UI", 9))
+
+    if update_mode:
+        # A running window handles the update itself so it can offer to save
+        # documents first; otherwise run a stand-alone updater window.
+        if _send_to_running_instance([UPDATE_COMMAND + ("yes" if auto_update else "")]):
+            return 0
+        return _standalone_update(app, auto_update)
 
     if not any(a.startswith("--screenshot=") for a in argv) and _send_to_running_instance(files):
         return 0
@@ -74,8 +84,12 @@ def main(argv=None) -> int:
         def read():
             data = bytes(sock.readAll()).decode("utf-8", "replace")
             for p in data.splitlines():
-                if p.strip():
-                    win.open_file(p.strip())
+                p = p.strip()
+                if p.startswith(UPDATE_COMMAND):
+                    yes = p.endswith("yes")
+                    QTimer.singleShot(0, lambda yes=yes: win.show_update_dialog(auto=yes))
+                elif p:
+                    win.open_file(p)
             if win.isMinimized():
                 win.showNormal()
             win.raise_()
@@ -99,8 +113,20 @@ def main(argv=None) -> int:
             for t in win.doc_tabs():
                 t.doc.set_modified(False)
             win.close()
-        QTimer.singleShot(4000, grab)
+        delay = next((int(a.split("=", 1)[1]) for a in argv[1:] if a.startswith("--screenshot-delay=")), 4000)
+        QTimer.singleShot(delay, grab)
     code = app.exec()
     server.close()
     shutdown_pool()
     return code
+
+
+def _standalone_update(app, auto: bool) -> int:
+    from .settings import Settings
+    from .updateui import UpdateDialog
+
+    theme.apply(app, Settings().get("theme", "light"))
+    app.setWindowIcon(icons.app_icon())
+    dlg = UpdateDialog(None, auto=auto)
+    dlg.exec()
+    return 0

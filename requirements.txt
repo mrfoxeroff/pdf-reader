@@ -1,3 +1,6 @@
 PySide6-Essentials>=6.8
 pymupdf>=1.25
 pyinstaller>=6.10
+pywin32>=306
+mammoth>=1.6
+python-docx>=1.1
